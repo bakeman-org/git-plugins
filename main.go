@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"time"
 	"unicode"
@@ -322,6 +323,16 @@ func highlightMatches(line, query string, isCurrent bool) string {
 
 type clearStatusMsg struct{}
 
+type linkOpenedMsg struct {
+	url string
+	err error
+}
+
+type linkCopiedMsg struct {
+	url string
+	err error
+}
+
 type starListModel struct {
 	owner string
 	repos []StarredRepo
@@ -544,6 +555,13 @@ func (m *starListModel) moveCursorTo(forward bool) {
 	}
 }
 
+func (m *starListModel) selectedRepo() (StarredRepo, bool) {
+	if len(m.visible) == 0 || m.cursor < 0 || m.cursor >= len(m.visible) {
+		return StarredRepo{}, false
+	}
+	return m.repos[m.visible[m.cursor]], true
+}
+
 func (m *starListModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if m.searchMode {
 		if km, ok := msg.(tea.KeyPressMsg); ok {
@@ -604,6 +622,28 @@ func (m *starListModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case clearStatusMsg:
 		m.status = ""
 		return m, nil
+	case linkOpenedMsg:
+		if msg.err != nil {
+			m.status = fmt.Sprintf("✗ open failed: %v", msg.err)
+			m.statusOK = false
+		} else {
+			m.status = "✓ opened " + msg.url
+			m.statusOK = true
+		}
+		return m, tea.Tick(2*time.Second, func(time.Time) tea.Msg {
+			return clearStatusMsg{}
+		})
+	case linkCopiedMsg:
+		if msg.err != nil {
+			m.status = fmt.Sprintf("✗ copy failed: %v", msg.err)
+			m.statusOK = false
+		} else {
+			m.status = "✓ copied " + msg.url
+			m.statusOK = true
+		}
+		return m, tea.Tick(2*time.Second, func(time.Time) tea.Msg {
+			return clearStatusMsg{}
+		})
 	case tea.WindowSizeMsg:
 		m.resize(msg.Width, msg.Height)
 		return m, nil
@@ -701,6 +741,26 @@ func (m *starListModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Tick(1200*time.Millisecond, func(time.Time) tea.Msg {
 				return clearStatusMsg{}
 			})
+		case "o":
+			if r, ok := m.selectedRepo(); ok {
+				url := r.HTMLURL
+				return m, func() tea.Msg {
+					if err := openURL(url); err != nil {
+						return linkOpenedMsg{url: url, err: err}
+					}
+					return linkOpenedMsg{url: url}
+				}
+			}
+		case "C":
+			if r, ok := m.selectedRepo(); ok {
+				url := r.HTMLURL
+				return m, func() tea.Msg {
+					if err := copyToClipboard(url); err != nil {
+						return linkCopiedMsg{url: url, err: err}
+					}
+					return linkCopiedMsg{url: url}
+				}
+			}
 		case "enter":
 			if len(m.visible) > 0 {
 				r := m.repos[m.visible[m.cursor]]
@@ -763,11 +823,11 @@ func (m *starListModel) View() tea.View {
 			mode = "filtered"
 		}
 		footer = labelStyle.Render(fmt.Sprintf(
-			"/%s  [%s]  %d/%d  ·  n/N next/prev  f filter  d desc  esc clear  enter open  q quit",
+			"/%s  [%s]  %d/%d  ·  n/N next/prev  f filter  d desc  esc clear  enter open  o open-url  C copy-url  q quit",
 			m.query, mode, m.cursor+1, len(m.visible)))
 	default:
 		footer = labelStyle.Render(
-			"j/k move · gg/G top/bottom · / search · d desc · enter open README · q quit")
+			"j/k move · gg/G top/bottom · / search · d desc · enter README · o open · C copy url · q quit")
 	}
 
 	content := strings.Join([]string{title, body, footer}, "\n")
@@ -1265,6 +1325,46 @@ func copyToClipboard(text string) error {
 	return errors.New("no clipboard tool found (install wl-clipboard / xclip / xsel)")
 }
 
+func openURL(url string) error {
+	var candidates [][]string
+	if b := os.Getenv("BROWSER"); b != "" {
+		candidates = append(candidates, []string{b, url})
+	}
+	switch runtime.GOOS {
+	case "darwin":
+		candidates = append(candidates, []string{"open", url})
+	case "windows":
+		candidates = append(candidates,
+			[]string{"rundll32", "url.dll,FileProtocolHandler", url},
+			[]string{"cmd", "/c", "start", "", url},
+		)
+	default:
+		candidates = append(candidates,
+			[]string{"xdg-open", url},
+			[]string{"sensible-browser", url},
+			[]string{"x-www-browser", url},
+		)
+	}
+	var lastErr error
+	for _, c := range candidates {
+		path, err := exec.LookPath(c[0])
+		if err != nil {
+			continue
+		}
+		cmd := exec.Command(path, c[1:]...)
+		if err := cmd.Start(); err != nil {
+			lastErr = err
+			continue
+		}
+		go func() { _ = cmd.Wait() }()
+		return nil
+	}
+	if lastErr != nil {
+		return lastErr
+	}
+	return errors.New("no browser opener found (set $BROWSER or install xdg-open)")
+}
+
 func main() {
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Usage: git seemystared [<user>]")
@@ -1290,7 +1390,10 @@ func main() {
 		fmt.Fprintln(os.Stderr, "  n/N       next/prev match         f  filter")
 		fmt.Fprintln(os.Stderr, "  d         toggle descriptions")
 		fmt.Fprintln(os.Stderr, "  esc       clear search (quit if empty)")
-		fmt.Fprintln(os.Stderr, "  enter     open README  q  quit")
+		fmt.Fprintln(os.Stderr, "  enter     open README")
+		fmt.Fprintln(os.Stderr, "  o         open repo in browser")
+		fmt.Fprintln(os.Stderr, "  C         copy repo URL to clipboard")
+		fmt.Fprintln(os.Stderr, "  q         quit")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Viewer TUI keys:")
 		fmt.Fprintln(os.Stderr, "  j/k ↑/↓   scroll       ctrl+d/u   half-page  gg/G  top/bottom")
@@ -1301,6 +1404,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Environment:")
 		fmt.Fprintln(os.Stderr, "  GITHUB_TOKEN   GitHub API token (60/hr anonymous → 5000/hr with token)")
+		fmt.Fprintln(os.Stderr, "  BROWSER        preferred browser opener for 'o'")
 	}
 	flag.Parse()
 
